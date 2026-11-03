@@ -4,6 +4,7 @@
 #include "secrets.h"
 
 const int ledPin = 2;
+const int ledBrightness = 102;  // 0 (off) to 255 (full brightness); 102 is 40%
 const unsigned long connectTimeoutMs = 20000;
 const unsigned long retryDelayMs = 5000;
 
@@ -23,9 +24,9 @@ unsigned long lastIphoneSeenAt = 0;
 
 void flashLed(int times) {
   for (int i = 0; i < times; i++) {
-    digitalWrite(ledPin, HIGH);
+    analogWrite(ledPin, ledBrightness);
     delay(200);
-    digitalWrite(ledPin, LOW);
+    analogWrite(ledPin, 0);
     delay(200);
   }
 }
@@ -74,7 +75,7 @@ void sendHeartbeat() {
 void setup() {
   Serial.begin(115200);
   pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW);
+  analogWrite(ledPin, 0);
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(false);  // loop() handles reconnecting, so a new connection also flashes the LED

@@ -33,6 +33,12 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_ATTEMPTS = 3;
 const TELEGRAM_RETRY_DELAY_MS = 5000;
 const TELEGRAM_POLL_SECONDS = 30;
+const STATUS_BUTTON = "📊 Status";
+const STATUS_KEYBOARD = {
+  keyboard: [[{ text: STATUS_BUTTON }]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
 
 function loadState(): State {
   const defaults: State = { status: "unknown", lastSeenAt: null, iphoneHome: false, subscribers: [] };
@@ -51,13 +57,13 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function sendToChat(chatId: number, text: string): Promise<void> {
+async function sendToChat(chatId: number, text: string, replyMarkup?: object): Promise<void> {
   for (let attempt = 1; attempt <= TELEGRAM_ATTEMPTS; attempt++) {
     try {
       const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text }),
+        body: JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup }),
         signal: AbortSignal.timeout(10_000),
       });
       if (response.ok) return;
@@ -93,8 +99,12 @@ function notify(text: string): void {
   });
 }
 
+function isChatAllowed(chatId: number): boolean {
+  return ALLOWED_CHAT_IDS.length === 0 || ALLOWED_CHAT_IDS.includes(chatId);
+}
+
 function handleStart(chatId: number): void {
-  if (ALLOWED_CHAT_IDS.length > 0 && !ALLOWED_CHAT_IDS.includes(chatId)) {
+  if (!isChatAllowed(chatId)) {
     console.log(`Ignored /start from chat ${chatId}: not in ALLOWED_CHAT_IDS`);
     return;
   }
@@ -104,8 +114,32 @@ function handleStart(chatId: number): void {
     console.log(`New subscriber ${chatId}`);
   }
   enqueue(() =>
-    sendToChat(chatId, `You will get a message when the home internet goes down or comes back. Current status: ${state.status}`),
+    sendToChat(
+      chatId,
+      `You will get a message when the home internet goes down or comes back. Current status: ${state.status}`,
+      STATUS_KEYBOARD,
+    ),
   );
+}
+
+function formatStatus(): string {
+  const lastSeen = state.lastSeenAt
+    ? `Last heartbeat: ${formatDuration(Date.now() - Date.parse(state.lastSeenAt))} ago`
+    : "No heartbeat received yet";
+  if (state.status === "online") {
+    return `🟢 Internet is up at home\n${lastSeen}\niPhone: ${state.iphoneHome ? "home" : "away"}`;
+  }
+  // The iPhone status is left out when offline: the ESP32 can't report it, so it would be stale.
+  if (state.status === "offline") return `🔴 No internet at home\n${lastSeen}`;
+  return `⚪ Status unknown: waiting for the ESP32\n${lastSeen}`;
+}
+
+function handleStatus(chatId: number): void {
+  if (!isChatAllowed(chatId)) {
+    console.log(`Ignored status request from chat ${chatId}: not in ALLOWED_CHAT_IDS`);
+    return;
+  }
+  enqueue(() => sendToChat(chatId, formatStatus(), STATUS_KEYBOARD));
 }
 
 async function pollTelegramUpdates(): Promise<void> {
@@ -126,7 +160,10 @@ async function pollTelegramUpdates(): Promise<void> {
       const { result } = (await response.json()) as { result: TelegramUpdate[] };
       for (const update of result) {
         offset = update.update_id + 1;
-        if (update.message?.text?.startsWith("/start")) handleStart(update.message.chat.id);
+        const text = update.message?.text;
+        if (!update.message || !text) continue;
+        if (text.startsWith("/start")) handleStart(update.message.chat.id);
+        else if (text === STATUS_BUTTON || text.startsWith("/status")) handleStatus(update.message.chat.id);
       }
     } catch (error) {
       console.error(`Telegram getUpdates failed: ${(error as Error).message}`);

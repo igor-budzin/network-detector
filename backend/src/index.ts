@@ -6,6 +6,7 @@ type Status = "unknown" | "online" | "offline";
 interface State {
   status: Status;
   lastSeenAt: string | null;
+  iphoneHome: boolean;
   subscribers: number[];
 }
 
@@ -34,7 +35,7 @@ const TELEGRAM_RETRY_DELAY_MS = 5000;
 const TELEGRAM_POLL_SECONDS = 30;
 
 function loadState(): State {
-  const defaults: State = { status: "unknown", lastSeenAt: null, subscribers: [] };
+  const defaults: State = { status: "unknown", lastSeenAt: null, iphoneHome: false, subscribers: [] };
   try {
     return { ...defaults, ...JSON.parse(readFileSync(STATE_FILE, "utf8")) };
   } catch {
@@ -84,6 +85,11 @@ function enqueue(task: () => Promise<void>): void {
 }
 
 function notify(text: string): void {
+  // The ESP32 can't report during an outage, so this is the status from its last heartbeat.
+  if (state.iphoneHome) {
+    console.log(`${text} (not sent: iPhone is home)`);
+    return;
+  }
   console.log(`${text} (subscribers: ${state.subscribers.length})`);
   enqueue(async () => {
     for (const chatId of [...state.subscribers]) {
@@ -156,12 +162,13 @@ function markOffline(): void {
   notify(`🔴 No internet at home: no request from the ESP32 for ${OFFLINE_TIMEOUT_MS / 1000}s`);
 }
 
-function handleHeartbeat(): void {
+function handleHeartbeat(iphoneHome: boolean): void {
   const wasOffline = state.status === "offline";
   const previousSeenAt = state.lastSeenAt;
 
   state.status = "online";
   state.lastSeenAt = new Date().toISOString();
+  state.iphoneHome = iphoneHome;
   saveState();
   armOfflineTimer();
 
@@ -185,13 +192,13 @@ const server = createServer((req, res) => {
   }
 
   if (route === "POST /heartbeat") {
-    handleHeartbeat();
+    handleHeartbeat(req.headers["x-iphone-home"] === "1");
     res.writeHead(204).end();
     return;
   }
   res
     .writeHead(200, { "Content-Type": "application/json" })
-    .end(JSON.stringify({ status: state.status, lastSeenAt: state.lastSeenAt }));
+    .end(JSON.stringify({ status: state.status, lastSeenAt: state.lastSeenAt, iphoneHome: state.iphoneHome }));
 });
 
 // Armed at startup too, so an outage that spans a server restart is still detected.

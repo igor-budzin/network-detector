@@ -11,12 +11,15 @@ const IPAddress iphoneIp(IPHONE_IP);
 const uint16_t iphonePort = 62078;  // iOS devices listen on this port
 const int32_t iphoneTimeoutMs = 3000;
 const unsigned long checkIntervalMs = 30000;
+const unsigned long iphoneAwayAfterMs = 300000;  // a locked iPhone can miss checks while its Wi-Fi sleeps
 
 const unsigned long heartbeatIntervalMs = 10000;  // the server reports an outage after 30 s of silence
 const uint16_t heartbeatTimeoutMs = 5000;
 
 unsigned long lastCheckAt = 0;
 unsigned long lastHeartbeatAt = 0;
+bool iphoneEverSeen = false;
+unsigned long lastIphoneSeenAt = 0;
 
 void flashLed(int times) {
   for (int i = 0; i < times; i++) {
@@ -48,6 +51,10 @@ bool isIphoneOnNetwork() {
   return found;
 }
 
+bool isIphoneHome() {
+  return iphoneEverSeen && millis() - lastIphoneSeenAt < iphoneAwayAfterMs;
+}
+
 void sendHeartbeat() {
   WiFiClientSecure client;
   client.setInsecure();  // skips certificate validation, so there is no certificate to keep updated
@@ -58,6 +65,7 @@ void sendHeartbeat() {
   }
   http.setTimeout(heartbeatTimeoutMs);
   http.addHeader("X-Device-Token", DEVICE_TOKEN);
+  http.addHeader("X-Iphone-Home", isIphoneHome() ? "1" : "0");
   int code = http.POST("");  // negative codes are connection errors
   Serial.printf("Heartbeat: %d\n", code);
   http.end();
@@ -74,18 +82,21 @@ void setup() {
 
 void loop() {
   if (WiFi.status() == WL_CONNECTED) {
-    if (millis() - lastHeartbeatAt >= heartbeatIntervalMs) {
-      lastHeartbeatAt = millis();
-      sendHeartbeat();
-    }
+    // The iPhone check runs first so the first heartbeat after connecting reports it.
     if (millis() - lastCheckAt >= checkIntervalMs) {
       lastCheckAt = millis();
       if (isIphoneOnNetwork()) {
+        iphoneEverSeen = true;
+        lastIphoneSeenAt = millis();
         Serial.println("iPhone found");
         flashLed(2);
       } else {
         Serial.println("iPhone not found");
       }
+    }
+    if (millis() - lastHeartbeatAt >= heartbeatIntervalMs) {
+      lastHeartbeatAt = millis();
+      sendHeartbeat();
     }
     delay(100);
     return;

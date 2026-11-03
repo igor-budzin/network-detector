@@ -85,11 +85,6 @@ function enqueue(task: () => Promise<void>): void {
 }
 
 function notify(text: string): void {
-  // The ESP32 can't report during an outage, so this is the status from its last heartbeat.
-  if (state.iphoneHome) {
-    console.log(`${text} (not sent: iPhone is home)`);
-    return;
-  }
   console.log(`${text} (subscribers: ${state.subscribers.length})`);
   enqueue(async () => {
     for (const chatId of [...state.subscribers]) {
@@ -172,7 +167,10 @@ function handleHeartbeat(iphoneHome: boolean): void {
   saveState();
   armOfflineTimer();
 
-  if (wasOffline) {
+  // The iPhone status is only reliable here: the ESP32 can't report it while the internet is down.
+  if (wasOffline && iphoneHome) {
+    console.log("Internet is back at home (not sent: iPhone is home)");
+  } else if (wasOffline) {
     const downtime = previousSeenAt
       ? ` (last seen ${formatDuration(Date.now() - Date.parse(previousSeenAt))} ago)`
       : "";

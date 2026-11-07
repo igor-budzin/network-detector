@@ -34,3 +34,10 @@ To deploy on Railway, set the root directory to `/backend`, attach a volume, and
 ### Subscribing
 
 Send `/start` to the bot. To restrict access, set `ALLOWED_CHAT_IDS` to a comma-separated list of chat IDs.
+
+The bot keyboard has two buttons:
+
+- **📊 Status** (or `/status`): the current state and the time of the last heartbeat.
+- **📈 Stats** (or `/stats`): uptime percentage, outage count, total and longest downtime for the last 24 hours, 7 days and 30 days, plus the most recent outages.
+
+Outages are kept in the state file for 90 days. Stats start from the first heartbeat after this feature was deployed. Outages shorter than `OFFLINE_TIMEOUT_SECONDS` are not detected, so they are not counted.

@@ -3,11 +3,21 @@ import { createServer } from "node:http";
 
 type Status = "unknown" | "online" | "offline";
 
+interface Outage {
+  start: string;
+  // null while the outage is still ongoing.
+  end: string | null;
+}
+
 interface State {
   status: Status;
   lastSeenAt: string | null;
   iphoneHome: boolean;
   subscribers: number[];
+  // Time of the first heartbeat ever received. Stats don't count anything before it.
+  monitoringSince: string | null;
+  // Oldest first. Online ranges are the gaps between outages.
+  outages: Outage[];
 }
 
 interface TelegramUpdate {
@@ -28,20 +38,45 @@ const STATE_FILE = process.env.STATE_FILE ?? "status.json";
 const OFFLINE_TIMEOUT_MS = Number(process.env.OFFLINE_TIMEOUT_SECONDS ?? 30) * 1000;
 // Empty means anyone can subscribe.
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS ?? "").split(",").filter(Boolean).map(Number);
+// Times in messages are always shown in Ukrainian time, whatever time zone the server runs in.
+const DATE_FORMAT = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Europe/Kyiv",
+  day: "2-digit",
+  month: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+});
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_ATTEMPTS = 3;
 const TELEGRAM_RETRY_DELAY_MS = 5000;
 const TELEGRAM_POLL_SECONDS = 30;
 const STATUS_BUTTON = "📊 Status";
+const STATS_BUTTON = "📈 Stats";
 const STATUS_KEYBOARD = {
-  keyboard: [[{ text: STATUS_BUTTON }]],
+  keyboard: [[{ text: STATUS_BUTTON }, { text: STATS_BUTTON }]],
   resize_keyboard: true,
   is_persistent: true,
 };
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Outages older than this are deleted so the state file doesn't grow forever.
+const OUTAGE_RETENTION_MS = 90 * DAY_MS;
+const STATS_WINDOWS = [
+  { label: "24h", ms: DAY_MS },
+  { label: "7 days", ms: 7 * DAY_MS },
+  { label: "30 days", ms: 30 * DAY_MS },
+];
+const RECENT_OUTAGES_SHOWN = 5;
 
 function loadState(): State {
-  const defaults: State = { status: "unknown", lastSeenAt: null, iphoneHome: false, subscribers: [] };
+  const defaults: State = {
+    status: "unknown",
+    lastSeenAt: null,
+    iphoneHome: false,
+    subscribers: [],
+    monitoringSince: null,
+    outages: [],
+  };
   try {
     return { ...defaults, ...JSON.parse(readFileSync(STATE_FILE, "utf8")) };
   } catch {
@@ -142,6 +177,68 @@ function handleStatus(chatId: number): void {
   enqueue(() => sendToChat(chatId, formatStatus(), STATUS_KEYBOARD));
 }
 
+function outageEndMs(outage: Outage, now: number): number {
+  return outage.end ? Date.parse(outage.end) : now;
+}
+
+function formatStats(): string {
+  if (!state.monitoringSince) return "No stats yet: waiting for the first heartbeat from the ESP32";
+  const now = Date.now();
+  const monitoringSince = Date.parse(state.monitoringSince);
+  const lines = [`📈 Stats (monitoring since ${DATE_FORMAT.format(monitoringSince)})`, ""];
+
+  for (const window of STATS_WINDOWS) {
+    const from = Math.max(now - window.ms, monitoringSince);
+    let downMs = 0;
+    let count = 0;
+    let longestMs = 0;
+    for (const outage of state.outages) {
+      // Clipped to the window, so an outage that started before it only counts the part inside.
+      const overlap = Math.min(outageEndMs(outage, now), now) - Math.max(Date.parse(outage.start), from);
+      if (overlap <= 0) continue;
+      downMs += overlap;
+      count++;
+      longestMs = Math.max(longestMs, overlap);
+    }
+    const uptime = now > from ? (100 * (now - from - downMs)) / (now - from) : 100;
+    const partial = from > now - window.ms ? ` (only ${formatDuration(now - from)} of data)` : "";
+    lines.push(`${window.label}${partial}: ${uptime.toFixed(2)}% up`);
+    lines.push(
+      count === 0
+        ? "   no outages"
+        : `   ${count} outage${count === 1 ? "" : "s"}, ${formatDuration(downMs)} down, longest ${formatDuration(longestMs)}`,
+    );
+  }
+
+  const lastOutage = state.outages.at(-1);
+  if (state.status === "online") {
+    const onlineSince = lastOutage?.end ? Date.parse(lastOutage.end) : monitoringSince;
+    lines.push("", `🟢 Online for ${formatDuration(now - onlineSince)} (since ${DATE_FORMAT.format(onlineSince)})`);
+  } else if (state.status === "offline" && lastOutage && !lastOutage.end) {
+    const start = Date.parse(lastOutage.start);
+    lines.push("", `🔴 Offline for ${formatDuration(now - start)} (since ${DATE_FORMAT.format(start)})`);
+  }
+
+  const recent = state.outages.slice(-RECENT_OUTAGES_SHOWN).reverse();
+  if (recent.length > 0) {
+    lines.push("", "Recent outages:");
+    for (const outage of recent) {
+      const start = Date.parse(outage.start);
+      const end = outage.end ? DATE_FORMAT.format(Date.parse(outage.end)) : "now";
+      lines.push(`🔴 ${DATE_FORMAT.format(start)} → ${end} (${formatDuration(outageEndMs(outage, now) - start)})`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function handleStats(chatId: number): void {
+  if (!isChatAllowed(chatId)) {
+    console.log(`Ignored stats request from chat ${chatId}: not in ALLOWED_CHAT_IDS`);
+    return;
+  }
+  enqueue(() => sendToChat(chatId, formatStats(), STATUS_KEYBOARD));
+}
+
 async function pollTelegramUpdates(): Promise<void> {
   let offset = 0;
   while (true) {
@@ -164,6 +261,7 @@ async function pollTelegramUpdates(): Promise<void> {
         if (!update.message || !text) continue;
         if (text.startsWith("/start")) handleStart(update.message.chat.id);
         else if (text === STATUS_BUTTON || text.startsWith("/status")) handleStatus(update.message.chat.id);
+        else if (text === STATS_BUTTON || text.startsWith("/stats")) handleStats(update.message.chat.id);
       }
     } catch (error) {
       console.error(`Telegram getUpdates failed: ${(error as Error).message}`);
@@ -175,8 +273,9 @@ async function pollTelegramUpdates(): Promise<void> {
 function formatDuration(ms: number): string {
   const totalMinutes = Math.floor(ms / 60_000);
   if (totalMinutes < 1) return `${Math.floor(ms / 1000)}s`;
-  const hours = Math.floor(totalMinutes / 60);
-  return hours > 0 ? `${hours}h ${totalMinutes % 60}m` : `${totalMinutes}m`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours >= 24) return `${Math.floor(totalHours / 24)}d ${totalHours % 24}h`;
+  return totalHours > 0 ? `${totalHours}h ${totalMinutes % 60}m` : `${totalMinutes}m`;
 }
 
 const state = loadState();
@@ -190,6 +289,9 @@ function armOfflineTimer(): void {
 function markOffline(): void {
   if (state.status === "offline") return;
   state.status = "offline";
+  // The outage started after the last heartbeat, not when the timeout fired.
+  // Nothing is recorded before the first heartbeat, since there is no known online period to compare with.
+  if (state.lastSeenAt) state.outages.push({ start: state.lastSeenAt, end: null });
   saveState();
   notify(`🔴 No internet at home: no request from the ESP32 for ${OFFLINE_TIMEOUT_MS / 1000}s`);
 }
@@ -198,9 +300,15 @@ function handleHeartbeat(iphoneHome: boolean): void {
   const wasOffline = state.status === "offline";
   const previousSeenAt = state.lastSeenAt;
 
+  const now = new Date().toISOString();
   state.status = "online";
-  state.lastSeenAt = new Date().toISOString();
+  state.lastSeenAt = now;
   state.iphoneHome = iphoneHome;
+  state.monitoringSince ??= now;
+  const lastOutage = state.outages.at(-1);
+  if (lastOutage && !lastOutage.end) lastOutage.end = now;
+  const cutoff = Date.now() - OUTAGE_RETENTION_MS;
+  state.outages = state.outages.filter((outage) => !outage.end || Date.parse(outage.end) >= cutoff);
   saveState();
   armOfflineTimer();
 

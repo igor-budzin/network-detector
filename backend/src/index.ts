@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { renderStatsImage } from "./charts.ts";
 
 type Status = "unknown" | "online" | "offline";
 
@@ -51,6 +52,7 @@ const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_ATTEMPTS = 3;
 const TELEGRAM_RETRY_DELAY_MS = 5000;
 const TELEGRAM_POLL_SECONDS = 30;
+const TELEGRAM_CAPTION_LIMIT = 1024;
 const STATUS_BUTTON = "📊 Status";
 const STATS_BUTTON = "📈 Stats";
 const STATUS_KEYBOARD = {
@@ -93,13 +95,27 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function sendToChat(chatId: number, text: string, replyMarkup?: object): Promise<void> {
+  await callTelegram(chatId, "sendMessage", JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup }), text);
+}
+
+async function sendPhotoToChat(chatId: number, png: Buffer, caption: string, replyMarkup?: object): Promise<void> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("photo", new Blob([new Uint8Array(png)],{ type: "image/png" }), "stats.png");
+  form.append("caption", caption);
+  if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
+  await callTelegram(chatId, "sendPhoto", form, `photo: ${caption}`);
+}
+
+// A string body is sent as JSON, FormData as multipart.
+async function callTelegram(chatId: number, method: string, body: string | FormData, description: string): Promise<void> {
   for (let attempt = 1; attempt <= TELEGRAM_ATTEMPTS; attempt++) {
     try {
-      const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      const response = await fetch(`${TELEGRAM_API}/${method}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup }),
-        signal: AbortSignal.timeout(10_000),
+        headers: typeof body === "string" ? { "Content-Type": "application/json" } : undefined,
+        body,
+        signal: AbortSignal.timeout(method === "sendPhoto" ? 30_000 : 10_000),
       });
       if (response.ok) return;
       if (response.status === 403) {
@@ -115,7 +131,7 @@ async function sendToChat(chatId: number, text: string, replyMarkup?: object): P
     }
     if (attempt < TELEGRAM_ATTEMPTS) await sleep(TELEGRAM_RETRY_DELAY_MS);
   }
-  console.error(`Giving up on Telegram message to ${chatId}: ${text}`);
+  console.error(`Giving up on Telegram message to ${chatId}: ${description}`);
 }
 
 // Messages go out one at a time, so "down" can't arrive after "back" during retries.
@@ -236,7 +252,34 @@ function handleStats(chatId: number): void {
     console.log(`Ignored stats request from chat ${chatId}: not in ALLOWED_CHAT_IDS`);
     return;
   }
-  enqueue(() => sendToChat(chatId, formatStats(), STATUS_KEYBOARD));
+  enqueue(async () => {
+    const text = formatStats();
+    const png = await renderStatsChart();
+    if (!png) {
+      await sendToChat(chatId, text, STATUS_KEYBOARD);
+    } else if (text.length <= TELEGRAM_CAPTION_LIMIT) {
+      await sendPhotoToChat(chatId, png, text, STATUS_KEYBOARD);
+    } else {
+      await sendPhotoToChat(chatId, png, "📈 Stats");
+      await sendToChat(chatId, text, STATUS_KEYBOARD);
+    }
+  });
+}
+
+// Null when there is nothing to chart yet or rendering failed: the text stats are sent alone then.
+async function renderStatsChart(): Promise<Buffer | null> {
+  if (!state.monitoringSince) return null;
+  const now = Date.now();
+  try {
+    return await renderStatsImage({
+      now,
+      monitoringSince: Date.parse(state.monitoringSince),
+      outages: state.outages.map((outage) => ({ start: Date.parse(outage.start), end: outageEndMs(outage, now) })),
+    });
+  } catch (error) {
+    console.error(`Stats chart rendering failed: ${(error as Error).message}`);
+    return null;
+  }
 }
 
 async function pollTelegramUpdates(): Promise<void> {

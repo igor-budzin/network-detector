@@ -37,6 +37,7 @@ const DEVICE_TOKEN = requireEnv("DEVICE_TOKEN");
 const PORT = Number(process.env.PORT ?? 3000);
 const STATE_FILE = process.env.STATE_FILE ?? "status.json";
 const OFFLINE_TIMEOUT_MS = Number(process.env.OFFLINE_TIMEOUT_SECONDS ?? 30) * 1000;
+const MIN_STATS_OUTAGE_MS = Number(process.env.MIN_STATS_OUTAGE_SECONDS ?? 300) * 1000;
 // Empty means anyone can subscribe.
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS ?? "").split(",").filter(Boolean).map(Number);
 // Times in messages are always shown in Ukrainian time, whatever time zone the server runs in.
@@ -197,10 +198,17 @@ function outageEndMs(outage: Outage, now: number): number {
   return outage.end ? Date.parse(outage.end) : now;
 }
 
+// Short blips are still recorded and notified, but left out of stats and charts.
+// An ongoing outage is counted once it has lasted MIN_STATS_OUTAGE_MS.
+function statsOutages(now: number): Outage[] {
+  return state.outages.filter((outage) => outageEndMs(outage, now) - Date.parse(outage.start) >= MIN_STATS_OUTAGE_MS);
+}
+
 function formatStats(): string {
   if (!state.monitoringSince) return "No stats yet: waiting for the first heartbeat from the ESP32";
   const now = Date.now();
   const monitoringSince = Date.parse(state.monitoringSince);
+  const outages = statsOutages(now);
   const lines = [`📈 Stats (monitoring since ${DATE_FORMAT.format(monitoringSince)})`, ""];
 
   for (const window of STATS_WINDOWS) {
@@ -208,7 +216,7 @@ function formatStats(): string {
     let downMs = 0;
     let count = 0;
     let longestMs = 0;
-    for (const outage of state.outages) {
+    for (const outage of outages) {
       // Clipped to the window, so an outage that started before it only counts the part inside.
       const overlap = Math.min(outageEndMs(outage, now), now) - Math.max(Date.parse(outage.start), from);
       if (overlap <= 0) continue;
@@ -228,14 +236,16 @@ function formatStats(): string {
 
   const lastOutage = state.outages.at(-1);
   if (state.status === "online") {
-    const onlineSince = lastOutage?.end ? Date.parse(lastOutage.end) : monitoringSince;
+    // Measured from the last counted outage, so a short blip doesn't reset it.
+    const lastCounted = outages.at(-1);
+    const onlineSince = lastCounted?.end ? Date.parse(lastCounted.end) : monitoringSince;
     lines.push("", `🟢 Online for ${formatDuration(now - onlineSince)} (since ${DATE_FORMAT.format(onlineSince)})`);
   } else if (state.status === "offline" && lastOutage && !lastOutage.end) {
     const start = Date.parse(lastOutage.start);
     lines.push("", `🔴 Offline for ${formatDuration(now - start)} (since ${DATE_FORMAT.format(start)})`);
   }
 
-  const recent = state.outages.slice(-RECENT_OUTAGES_SHOWN).reverse();
+  const recent = outages.slice(-RECENT_OUTAGES_SHOWN).reverse();
   if (recent.length > 0) {
     lines.push("", "Recent outages:");
     for (const outage of recent) {
@@ -274,7 +284,7 @@ async function renderStatsChart(): Promise<Buffer | null> {
     return await renderStatsImage({
       now,
       monitoringSince: Date.parse(state.monitoringSince),
-      outages: state.outages.map((outage) => ({ start: Date.parse(outage.start), end: outageEndMs(outage, now) })),
+      outages: statsOutages(now).map((outage) => ({ start: Date.parse(outage.start), end: outageEndMs(outage, now) })),
     });
   } catch (error) {
     console.error(`Stats chart rendering failed: ${(error as Error).message}`);

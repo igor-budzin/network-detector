@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { renderStatsImage } from "./charts.ts";
+import { renderDowntimeImage, renderTimelineImage } from "./charts.ts";
 import { formatDuration, plural } from "./format.ts";
 
 type Status = "unknown" | "online" | "offline";
@@ -104,13 +104,13 @@ async function sendToChat(chatId: number, text: string, replyMarkup?: object): P
   await callTelegram(chatId, "sendMessage", JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup }), text);
 }
 
-async function sendPhotoToChat(chatId: number, png: Buffer, caption: string, replyMarkup?: object): Promise<void> {
+async function sendPhotoToChat(chatId: number, png: Buffer, caption?: string, replyMarkup?: object): Promise<void> {
   const form = new FormData();
   form.append("chat_id", String(chatId));
   form.append("photo", new Blob([new Uint8Array(png)],{ type: "image/png" }), "stats.png");
-  form.append("caption", caption);
+  if (caption) form.append("caption", caption);
   if (replyMarkup) form.append("reply_markup", JSON.stringify(replyMarkup));
-  await callTelegram(chatId, "sendPhoto", form, `photo: ${caption}`);
+  await callTelegram(chatId, "sendPhoto", form, `photo: ${caption ?? "chart"}`);
 }
 
 // A string body is sent as JSON, FormData as multipart.
@@ -270,28 +270,34 @@ function handleStats(chatId: number): void {
   }
   enqueue(async () => {
     const text = formatStats();
-    const png = await renderStatsChart();
-    if (!png) {
+    const charts = await renderStatsCharts();
+    if (!charts) {
       await sendToChat(chatId, text, STATUS_KEYBOARD);
-    } else if (text.length <= TELEGRAM_CAPTION_LIMIT) {
-      await sendPhotoToChat(chatId, png, text, STATUS_KEYBOARD);
+      return;
+    }
+    // Sent as separate photos, not an album, so each is shown at full chat width.
+    await sendPhotoToChat(chatId, charts.timeline);
+    if (text.length <= TELEGRAM_CAPTION_LIMIT) {
+      await sendPhotoToChat(chatId, charts.downtime, text, STATUS_KEYBOARD);
     } else {
-      await sendPhotoToChat(chatId, png, "📈 Статистика");
+      await sendPhotoToChat(chatId, charts.downtime);
       await sendToChat(chatId, text, STATUS_KEYBOARD);
     }
   });
 }
 
 // Null when there is nothing to chart yet or rendering failed: the text stats are sent alone then.
-async function renderStatsChart(): Promise<Buffer | null> {
+async function renderStatsCharts(): Promise<{ timeline: Buffer; downtime: Buffer } | null> {
   if (!state.monitoringSince) return null;
   const now = Date.now();
+  const input = {
+    now,
+    monitoringSince: Date.parse(state.monitoringSince),
+    outages: statsOutages(now).map((outage) => ({ start: Date.parse(outage.start), end: outageEndMs(outage, now) })),
+  };
   try {
-    return await renderStatsImage({
-      now,
-      monitoringSince: Date.parse(state.monitoringSince),
-      outages: statsOutages(now).map((outage) => ({ start: Date.parse(outage.start), end: outageEndMs(outage, now) })),
-    });
+    const [timeline, downtime] = await Promise.all([renderTimelineImage(input), renderDowntimeImage(input)]);
+    return { timeline, downtime };
   } catch (error) {
     console.error(`Stats chart rendering failed: ${(error as Error).message}`);
     return null;

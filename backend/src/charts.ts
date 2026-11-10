@@ -20,10 +20,11 @@ const TIME_ZONE = "Europe/Kyiv";
 const HOUR_MS = 60 * 60 * 1000;
 const TIMELINE_DAYS = 7;
 const DOWNTIME_DAYS = 14;
-const WIDTH = 1200;
-const PADDING = 24;
-const TIMELINE_HEIGHT = 440;
-const DOWNTIME_HEIGHT = 420;
+// Telegram downscales photos to 1280px on the longest side and fits them to the chat width, so a
+// near-4:3 image with large type reads much bigger on a phone than a wide one with small type.
+const WIDTH = 1280;
+const HEIGHT = 960;
+const PADDING = 32;
 
 // Light theme of the dataviz reference palette. Telegram shows photos on both light and dark
 // backgrounds, so the image always carries its own opaque surface.
@@ -51,7 +52,7 @@ const FONT_FAMILY = `Inter, "Inter Cyrillic"`;
 
 Chart.register(...registerables);
 Chart.defaults.font.family = FONT_FAMILY;
-Chart.defaults.font.size = 16;
+Chart.defaults.font.size = 24;
 Chart.defaults.color = COLORS.textSecondary;
 Chart.defaults.borderColor = COLORS.grid;
 
@@ -116,14 +117,51 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
     }
   });
 
-  const shared = { borderRadius: 4, borderSkipped: false, grouped: false, barPercentage: 0.7 } as const;
+  // Duration of each outage segment: inside it in white when it fits, otherwise just above it.
+  // A label that would run into the previous one in the same row is skipped.
+  const durationLabels: Plugin<"bar"> = {
+    id: "durationLabels",
+    afterDatasetsDraw(chart) {
+      const { ctx, chartArea } = chart;
+      const lastRightByRow = new Map<string, number>();
+      ctx.save();
+      ctx.textAlign = "center";
+      chart.getDatasetMeta(0).data.forEach((element, i) => {
+        const segment = offline[i];
+        const bar = element as unknown as { x: number; base: number; y: number; height: number };
+        // Rounded to whole minutes: the hour fractions lose precision, turning 4 h into 3 h 59 min.
+        const minutes = Math.max(1, Math.round((segment.x[1] - segment.x[0]) * 60));
+        const label = formatDuration(minutes * 60_000);
+        const left = Math.min(bar.x, bar.base);
+        const width = Math.abs(bar.x - bar.base);
+        ctx.font = `600 18px ${FONT_FAMILY}`;
+        const textWidth = ctx.measureText(label).width;
+        if (textWidth + 16 <= width) {
+          ctx.fillStyle = "#ffffff";
+          ctx.textBaseline = "middle";
+          ctx.fillText(label, left + width / 2, bar.y);
+          return;
+        }
+        const half = textWidth / 2;
+        const center = Math.min(Math.max(left + width / 2, chartArea.left + half), chartArea.right - half);
+        if (center - half < (lastRightByRow.get(segment.y) ?? -Infinity) + 8) return;
+        lastRightByRow.set(segment.y, center + half);
+        ctx.fillStyle = COLORS.offline;
+        ctx.textBaseline = "bottom";
+        ctx.fillText(label, center, bar.y - bar.height / 2 - 4);
+      });
+      ctx.restore();
+    },
+  };
+
+  const shared = { borderRadius: 6, borderSkipped: false, grouped: false, barPercentage: 0.6 } as const;
   return {
     type: "bar",
     data: {
       labels,
       datasets: [
         // Lower `order` is drawn on top, so outages sit over the online band.
-        { label: "Немає інтернету", data: offline, backgroundColor: COLORS.offline, order: 0, minBarLength: 3, ...shared },
+        { label: "Немає інтернету", data: offline, backgroundColor: COLORS.offline, order: 0, minBarLength: 4, ...shared },
         { label: "Є інтернет", data: online, backgroundColor: COLORS.online, order: 1, ...shared },
         { label: "Немає даних", data: noData, backgroundColor: COLORS.noData, order: 2, ...shared },
       ],
@@ -139,13 +177,20 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
           text: `Останні ${TIMELINE_DAYS} днів (київський час)`,
           align: "start",
           color: COLORS.textPrimary,
-          font: { size: 22, weight: 600 },
-          padding: { bottom: 8 },
+          font: { size: 34, weight: 600 },
+          padding: { bottom: 12 },
         },
         legend: {
           position: "top",
           align: "start",
-          labels: { boxWidth: 14, boxHeight: 14, useBorderRadius: true, borderRadius: 3, color: COLORS.textSecondary },
+          labels: {
+            boxWidth: 22,
+            boxHeight: 22,
+            padding: 16,
+            useBorderRadius: true,
+            borderRadius: 4,
+            color: COLORS.textSecondary,
+          },
         },
         tooltip: { enabled: false },
       },
@@ -165,6 +210,7 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
         },
       },
     },
+    plugins: [durationLabels],
   };
 }
 
@@ -196,13 +242,22 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
       meta.data.forEach((bar, i) => {
         const minutes = downMinutes[i];
         if (minutes === null) {
-          ctx.font = `400 13px ${FONT_FAMILY}`;
+          // Rotated: 14 day columns are too narrow for the phrase written horizontally.
+          ctx.save();
+          ctx.translate(bar.x, chart.scales.y.bottom - 10);
+          ctx.rotate(-Math.PI / 2);
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.font = `400 20px ${FONT_FAMILY}`;
           ctx.fillStyle = COLORS.muted;
-          ctx.fillText("немає даних", bar.x, chart.scales.y.bottom - 6);
+          ctx.fillText("немає даних", 0, 0);
+          ctx.restore();
         } else if (minutes > 0) {
-          ctx.font = `600 15px ${FONT_FAMILY}`;
+          ctx.font = `600 20px ${FONT_FAMILY}`;
           ctx.fillStyle = COLORS.textPrimary;
-          ctx.fillText(formatValue(minutes), bar.x, bar.y - 6);
+          // "1 год 30 хв" is wider than a column, so each unit goes on its own line, largest on top.
+          const lines = formatValue(minutes).match(/\S+ \S+/g) ?? [];
+          lines.reverse().forEach((line, row) => ctx.fillText(line, bar.x, bar.y - 8 - row * 24));
         }
       });
       ctx.restore();
@@ -227,22 +282,23 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
     options: {
       responsive: false,
       animation: false,
-      layout: { padding: { top: 24, right: 8 } },
+      layout: { padding: { right: 8 } },
       plugins: {
         title: {
           display: true,
-          text: `Час без інтернету по днях, останні ${DOWNTIME_DAYS} днів`,
+          text: `Без інтернету по днях, ${DOWNTIME_DAYS} днів`,
           align: "start",
           color: COLORS.textPrimary,
-          font: { size: 22, weight: 600 },
-          padding: { bottom: 12 },
+          font: { size: 34, weight: 600 },
+          // Room for the two-line value label above the tallest bar.
+          padding: { bottom: 64 },
         },
         legend: { display: false },
         tooltip: { enabled: false },
       },
       scales: {
         x: {
-          ticks: { color: COLORS.muted, maxRotation: 0, autoSkip: false, font: { size: 13 } },
+          ticks: { color: COLORS.muted, maxRotation: 0, autoSkip: false, font: { size: 18 } },
           grid: { display: false },
           border: { color: COLORS.baseline },
         },
@@ -260,28 +316,25 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
   };
 }
 
-// Renders the chart and copies it onto `target`. Copied before destroy(), which clears the canvas.
-function drawChart(
-  config: ChartConfiguration<"bar", any, string>,
-  target: Canvas,
-  x: number,
-  y: number,
-  height: number,
-): void {
-  const canvas = createCanvas(target.width - 2 * x, height);
-  // Chart.js only needs a 2D context, which @napi-rs/canvas provides.
-  const chart = new Chart(canvas as unknown as HTMLCanvasElement, config);
-  target.getContext("2d").drawImage(canvas, x, y);
-  chart.destroy();
-}
-
-export function renderStatsImage(input: ChartInput): Promise<Buffer> {
-  const gap = 32;
-  const image = createCanvas(WIDTH, PADDING * 2 + TIMELINE_HEIGHT + gap + DOWNTIME_HEIGHT);
+// Renders one chart as a standalone PNG on an opaque surface. The chart is copied onto the image
+// before destroy(), which clears its canvas.
+function renderChart(config: ChartConfiguration<"bar", any, string>): Promise<Buffer> {
+  const image: Canvas = createCanvas(WIDTH, HEIGHT);
   const ctx = image.getContext("2d");
   ctx.fillStyle = COLORS.surface;
-  ctx.fillRect(0, 0, image.width, image.height);
-  drawChart(timelineConfig(input), image, PADDING, PADDING, TIMELINE_HEIGHT);
-  drawChart(downtimeConfig(input), image, PADDING, PADDING + TIMELINE_HEIGHT + gap, DOWNTIME_HEIGHT);
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  const canvas = createCanvas(WIDTH - 2 * PADDING, HEIGHT - 2 * PADDING);
+  // Chart.js only needs a 2D context, which @napi-rs/canvas provides.
+  const chart = new Chart(canvas as unknown as HTMLCanvasElement, config);
+  ctx.drawImage(canvas, PADDING, PADDING);
+  chart.destroy();
   return image.encode("png");
+}
+
+export function renderTimelineImage(input: ChartInput): Promise<Buffer> {
+  return renderChart(timelineConfig(input));
+}
+
+export function renderDowntimeImage(input: ChartInput): Promise<Buffer> {
+  return renderChart(downtimeConfig(input));
 }

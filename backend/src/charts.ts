@@ -98,6 +98,7 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
   const online: Segment[] = [];
   const offline: Segment[] = [];
   const noData: Segment[] = [];
+  const onlineGaps: Segment[] = [];
   const days = recentDays(input.now, TIMELINE_DAYS);
   const labels = days.map((day) => DAY_LABEL.format(day.start));
 
@@ -111,37 +112,59 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
     const covered = clip(known, day);
     if (!covered) return;
     online.push({ x: toHours(covered), y: labels[i] });
+    // The green band is drawn whole under the outages; the stretches between them are kept for labels.
+    let onlineFrom = covered.start;
     for (const outage of input.outages) {
       const part = clip(outage, covered);
-      if (part) offline.push({ x: toHours(part), y: labels[i] });
+      if (!part) continue;
+      offline.push({ x: toHours(part), y: labels[i] });
+      if (part.start > onlineFrom) onlineGaps.push({ x: toHours({ start: onlineFrom, end: part.start }), y: labels[i] });
+      onlineFrom = Math.max(onlineFrom, part.end);
     }
+    if (covered.end > onlineFrom) onlineGaps.push({ x: toHours({ start: onlineFrom, end: covered.end }), y: labels[i] });
   });
 
-  // Duration of each outage segment: inside it in white when it fits, otherwise just above it.
-  // A label that would run into the previous one in the same row is skipped.
+  // Rounded to whole minutes: the hour fractions lose precision, turning 4 h into 3 h 59 min.
+  const segmentLabel = (segment: Segment) =>
+    formatDuration(Math.max(1, Math.round((segment.x[1] - segment.x[0]) * 60)) * 60_000);
+
+  // Durations inside the bars, in white. Online stretches are labelled only where the text fits;
+  // an outage too narrow for its label gets it just above instead, unless that would run into
+  // the previous label in the same row.
   const durationLabels: Plugin<"bar"> = {
     id: "durationLabels",
     afterDatasetsDraw(chart) {
       const { ctx, chartArea } = chart;
-      const lastRightByRow = new Map<string, number>();
+      const xScale = chart.scales.x;
+      const rowY = new Map(labels.map((label, i) => [label, chart.scales.y.getPixelForValue(i)]));
+      const fitsInside = (label: string, width: number) => ctx.measureText(label).width + 16 <= width;
       ctx.save();
       ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.font = `600 18px ${FONT_FAMILY}`;
+      ctx.fillStyle = "#ffffff";
+
+      for (const gap of onlineGaps) {
+        const label = segmentLabel(gap);
+        const left = xScale.getPixelForValue(gap.x[0]);
+        const width = xScale.getPixelForValue(gap.x[1]) - left;
+        if (fitsInside(label, width)) ctx.fillText(label, left + width / 2, rowY.get(gap.y)!);
+      }
+
+      const lastRightByRow = new Map<string, number>();
       chart.getDatasetMeta(0).data.forEach((element, i) => {
         const segment = offline[i];
         const bar = element as unknown as { x: number; base: number; y: number; height: number };
-        // Rounded to whole minutes: the hour fractions lose precision, turning 4 h into 3 h 59 min.
-        const minutes = Math.max(1, Math.round((segment.x[1] - segment.x[0]) * 60));
-        const label = formatDuration(minutes * 60_000);
+        const label = segmentLabel(segment);
         const left = Math.min(bar.x, bar.base);
         const width = Math.abs(bar.x - bar.base);
-        ctx.font = `600 18px ${FONT_FAMILY}`;
-        const textWidth = ctx.measureText(label).width;
-        if (textWidth + 16 <= width) {
+        if (fitsInside(label, width)) {
           ctx.fillStyle = "#ffffff";
           ctx.textBaseline = "middle";
           ctx.fillText(label, left + width / 2, bar.y);
           return;
         }
+        const textWidth = ctx.measureText(label).width;
         const half = textWidth / 2;
         const center = Math.min(Math.max(left + width / 2, chartArea.left + half), chartArea.right - half);
         if (center - half < (lastRightByRow.get(segment.y) ?? -Infinity) + 8) return;

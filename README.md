@@ -37,7 +37,9 @@ Send `/start` to the bot. To restrict access, set `ALLOWED_CHAT_IDS` to a comma-
 
 The bot keyboard has two buttons:
 
-- **📊 Status** (or `/status`): the current state and the time of the last heartbeat.
-- **📈 Stats** (or `/stats`): uptime percentage, outage count, total and longest downtime for the last 24 hours, 7 days and 30 days, plus the most recent outages. The stats come with a chart image: an online/offline timeline for the last 7 days and downtime per day for the last 14 days, in Kyiv time. The image is drawn with Chart.js on `@napi-rs/canvas`, which uses prebuilt binaries, so no system libraries are needed. If rendering fails, the stats are sent as text only.
+All bot messages and chart labels are in Ukrainian.
+
+- **📊 Статус** (or `/status`): the current state and the time of the last heartbeat.
+- **📈 Статистика** (or `/stats`): uptime percentage, outage count, total and longest downtime for the last 24 hours, 7 days and 30 days, plus the most recent outages. The stats come with a chart image: an online/offline timeline for the last 7 days and downtime per day for the last 14 days, in Kyiv time. The image is drawn with Chart.js on `@napi-rs/canvas`, which uses prebuilt binaries, so no system libraries are needed. If rendering fails, the stats are sent as text only.
 
 Outages are kept in the state file for 90 days. Stats start from the first heartbeat after this feature was deployed. Outages shorter than `OFFLINE_TIMEOUT_SECONDS` are not detected, so they are not counted. Outages shorter than `MIN_STATS_OUTAGE_SECONDS` (default 5 minutes) are still notified, but left out of the stats and charts.

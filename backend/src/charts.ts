@@ -2,6 +2,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCanvas, GlobalFonts, type Canvas } from "@napi-rs/canvas";
 import { Chart, registerables, type ChartConfiguration, type Plugin } from "chart.js";
+import { formatDuration } from "./format.ts";
 
 export interface Interval {
   start: number;
@@ -40,16 +41,21 @@ const COLORS = {
 
 // Containers usually have no system fonts, so a bundled font is registered or text would not render.
 const fontDir = join(dirname(fileURLToPath(import.meta.resolve("@fontsource/inter/LICENSE"))), "files");
-GlobalFonts.registerFromPath(join(fontDir, "inter-latin-400-normal.woff2"), "Inter");
-GlobalFonts.registerFromPath(join(fontDir, "inter-latin-600-normal.woff2"), "Inter");
+// The Latin subset covers digits and punctuation, the Cyrillic one the Ukrainian letters. Each subset
+// needs its own family name: files sharing one are not merged, and the second is ignored.
+for (const weight of [400, 600]) {
+  GlobalFonts.registerFromPath(join(fontDir, `inter-latin-${weight}-normal.woff2`), "Inter");
+  GlobalFonts.registerFromPath(join(fontDir, `inter-cyrillic-${weight}-normal.woff2`), "Inter Cyrillic");
+}
+const FONT_FAMILY = `Inter, "Inter Cyrillic"`;
 
 Chart.register(...registerables);
-Chart.defaults.font.family = "Inter";
+Chart.defaults.font.family = FONT_FAMILY;
 Chart.defaults.font.size = 16;
 Chart.defaults.color = COLORS.textSecondary;
 Chart.defaults.borderColor = COLORS.grid;
 
-const DAY_LABEL = new Intl.DateTimeFormat("en-GB", { timeZone: TIME_ZONE, weekday: "short", day: "2-digit" });
+const DAY_LABEL = new Intl.DateTimeFormat("uk-UA", { timeZone: TIME_ZONE, weekday: "short", day: "2-digit" });
 const TIME_PARTS = new Intl.DateTimeFormat("en-GB", {
   timeZone: TIME_ZONE,
   hour: "2-digit",
@@ -117,9 +123,9 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
       labels,
       datasets: [
         // Lower `order` is drawn on top, so outages sit over the online band.
-        { label: "Offline", data: offline, backgroundColor: COLORS.offline, order: 0, minBarLength: 3, ...shared },
-        { label: "Online", data: online, backgroundColor: COLORS.online, order: 1, ...shared },
-        { label: "No data", data: noData, backgroundColor: COLORS.noData, order: 2, ...shared },
+        { label: "Немає інтернету", data: offline, backgroundColor: COLORS.offline, order: 0, minBarLength: 3, ...shared },
+        { label: "Є інтернет", data: online, backgroundColor: COLORS.online, order: 1, ...shared },
+        { label: "Немає даних", data: noData, backgroundColor: COLORS.noData, order: 2, ...shared },
       ],
     },
     options: {
@@ -130,7 +136,7 @@ function timelineConfig(input: ChartInput): ChartConfiguration<"bar", Segment[],
       plugins: {
         title: {
           display: true,
-          text: `Last ${TIMELINE_DAYS} days (Kyiv time)`,
+          text: `Останні ${TIMELINE_DAYS} днів (київський час)`,
           align: "start",
           color: COLORS.textPrimary,
           font: { size: 22, weight: 600 },
@@ -175,8 +181,7 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
   });
   const useHours = Math.max(0, ...downMinutes.map((v) => v ?? 0)) >= 180;
   const values = downMinutes.map((v) => (v === null ? null : useHours ? v / 60 : v));
-  const formatValue = (minutes: number) =>
-    minutes < 60 ? `${Math.max(1, Math.round(minutes))}m` : `${(minutes / 60).toFixed(1)}h`;
+  const formatValue = (minutes: number) => formatDuration(Math.max(1, Math.round(minutes)) * 60_000);
 
   // Values only on bars that have any downtime, so the zero days stay quiet.
   // Days before monitoring started are marked, so they don't read as days without outages.
@@ -191,11 +196,11 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
       meta.data.forEach((bar, i) => {
         const minutes = downMinutes[i];
         if (minutes === null) {
-          ctx.font = "400 13px Inter";
+          ctx.font = `400 13px ${FONT_FAMILY}`;
           ctx.fillStyle = COLORS.muted;
-          ctx.fillText("no data", bar.x, chart.scales.y.bottom - 6);
+          ctx.fillText("немає даних", bar.x, chart.scales.y.bottom - 6);
         } else if (minutes > 0) {
-          ctx.font = "600 15px Inter";
+          ctx.font = `600 15px ${FONT_FAMILY}`;
           ctx.fillStyle = COLORS.textPrimary;
           ctx.fillText(formatValue(minutes), bar.x, bar.y - 6);
         }
@@ -210,7 +215,7 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
       labels: days.map((day) => DAY_LABEL.format(day.start)),
       datasets: [
         {
-          label: "Downtime",
+          label: "Без інтернету",
           data: values,
           backgroundColor: COLORS.offline,
           borderRadius: { topLeft: 4, topRight: 4 },
@@ -226,7 +231,7 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
       plugins: {
         title: {
           display: true,
-          text: `Downtime per day, last ${DOWNTIME_DAYS} days`,
+          text: `Час без інтернету по днях, останні ${DOWNTIME_DAYS} днів`,
           align: "start",
           color: COLORS.textPrimary,
           font: { size: 22, weight: 600 },
@@ -244,7 +249,7 @@ function downtimeConfig(input: ChartInput): ChartConfiguration<"bar", (number | 
         y: {
           beginAtZero: true,
           suggestedMax: useHours ? 1 : 10,
-          title: { display: true, text: useHours ? "hours" : "minutes", color: COLORS.muted },
+          title: { display: true, text: useHours ? "години" : "хвилини", color: COLORS.muted },
           ticks: { color: COLORS.muted, precision: 0, maxTicksLimit: 6 },
           grid: { color: COLORS.grid },
           border: { display: false },

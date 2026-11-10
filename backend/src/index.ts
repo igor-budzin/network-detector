@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { renderStatsImage } from "./charts.ts";
+import { formatDuration, plural } from "./format.ts";
 
 type Status = "unknown" | "online" | "offline";
 
@@ -41,7 +42,7 @@ const MIN_STATS_OUTAGE_MS = Number(process.env.MIN_STATS_OUTAGE_SECONDS ?? 300) 
 // Empty means anyone can subscribe.
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS ?? "").split(",").filter(Boolean).map(Number);
 // Times in messages are always shown in Ukrainian time, whatever time zone the server runs in.
-const DATE_FORMAT = new Intl.DateTimeFormat("en-GB", {
+const DATE_FORMAT = new Intl.DateTimeFormat("uk-UA", {
   timeZone: "Europe/Kyiv",
   day: "2-digit",
   month: "short",
@@ -54,8 +55,12 @@ const TELEGRAM_ATTEMPTS = 3;
 const TELEGRAM_RETRY_DELAY_MS = 5000;
 const TELEGRAM_POLL_SECONDS = 30;
 const TELEGRAM_CAPTION_LIMIT = 1024;
-const STATUS_BUTTON = "📊 Status";
-const STATS_BUTTON = "📈 Stats";
+const STATUS_BUTTON = "📊 Статус";
+const STATS_BUTTON = "📈 Статистика";
+// Telegram keeps showing the old keyboard until the bot sends a new one, so the old texts still work.
+const STATUS_BUTTON_TEXTS = [STATUS_BUTTON, "📊 Status"];
+const STATS_BUTTON_TEXTS = [STATS_BUTTON, "📈 Stats"];
+const STATUS_NAMES: Record<Status, string> = { online: "є інтернет", offline: "немає інтернету", unknown: "невідомо" };
 const STATUS_KEYBOARD = {
   keyboard: [[{ text: STATUS_BUTTON }, { text: STATS_BUTTON }]],
   resize_keyboard: true,
@@ -65,9 +70,9 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // Outages older than this are deleted so the state file doesn't grow forever.
 const OUTAGE_RETENTION_MS = 90 * DAY_MS;
 const STATS_WINDOWS = [
-  { label: "24h", ms: DAY_MS },
-  { label: "7 days", ms: 7 * DAY_MS },
-  { label: "30 days", ms: 30 * DAY_MS },
+  { label: "24 години", ms: DAY_MS },
+  { label: "7 днів", ms: 7 * DAY_MS },
+  { label: "30 днів", ms: 30 * DAY_MS },
 ];
 const RECENT_OUTAGES_SHOWN = 5;
 
@@ -168,7 +173,7 @@ function handleStart(chatId: number): void {
   enqueue(() =>
     sendToChat(
       chatId,
-      `You will get a message when the home internet goes down or comes back. Current status: ${state.status}`,
+      `Ви отримаєте повідомлення, коли вдома зникне або з'явиться інтернет. Зараз: ${STATUS_NAMES[state.status]}`,
       STATUS_KEYBOARD,
     ),
   );
@@ -176,14 +181,14 @@ function handleStart(chatId: number): void {
 
 function formatStatus(): string {
   const lastSeen = state.lastSeenAt
-    ? `Last heartbeat: ${formatDuration(Date.now() - Date.parse(state.lastSeenAt))} ago`
-    : "No heartbeat received yet";
+    ? `Останній сигнал: ${formatDuration(Date.now() - Date.parse(state.lastSeenAt))} тому`
+    : "Ще не було жодного сигналу";
   if (state.status === "online") {
-    return `🟢 Internet is up at home\n${lastSeen}\niPhone: ${state.iphoneHome ? "home" : "away"}`;
+    return `🟢 Вдома є інтернет\n${lastSeen}\niPhone: ${state.iphoneHome ? "вдома" : "не вдома"}`;
   }
   // The iPhone status is left out when offline: the ESP32 can't report it, so it would be stale.
-  if (state.status === "offline") return `🔴 No internet at home\n${lastSeen}`;
-  return `⚪ Status unknown: waiting for the ESP32\n${lastSeen}`;
+  if (state.status === "offline") return `🔴 Вдома немає інтернету\n${lastSeen}`;
+  return `⚪ Статус невідомий: чекаю на ESP32\n${lastSeen}`;
 }
 
 function handleStatus(chatId: number): void {
@@ -205,11 +210,11 @@ function statsOutages(now: number): Outage[] {
 }
 
 function formatStats(): string {
-  if (!state.monitoringSince) return "No stats yet: waiting for the first heartbeat from the ESP32";
+  if (!state.monitoringSince) return "Статистики ще немає: чекаю на перший сигнал від ESP32";
   const now = Date.now();
   const monitoringSince = Date.parse(state.monitoringSince);
   const outages = statsOutages(now);
-  const lines = [`📈 Stats (monitoring since ${DATE_FORMAT.format(monitoringSince)})`, ""];
+  const lines = [`📈 Статистика (моніторинг з ${DATE_FORMAT.format(monitoringSince)})`, ""];
 
   for (const window of STATS_WINDOWS) {
     const from = Math.max(now - window.ms, monitoringSince);
@@ -225,12 +230,13 @@ function formatStats(): string {
       longestMs = Math.max(longestMs, overlap);
     }
     const uptime = now > from ? (100 * (now - from - downMs)) / (now - from) : 100;
-    const partial = from > now - window.ms ? ` (only ${formatDuration(now - from)} of data)` : "";
-    lines.push(`${window.label}${partial}: ${uptime.toFixed(2)}% up`);
+    const partial = from > now - window.ms ? ` (дані лише за ${formatDuration(now - from)})` : "";
+    lines.push(`${window.label}${partial}: інтернет був ${uptime.toFixed(2)}% часу`);
+    const outageWord = plural(count, { one: "відключення", few: "відключення", many: "відключень" });
     lines.push(
       count === 0
-        ? "   no outages"
-        : `   ${count} outage${count === 1 ? "" : "s"}, ${formatDuration(downMs)} down, longest ${formatDuration(longestMs)}`,
+        ? "   без відключень"
+        : `   ${count} ${outageWord}, без інтернету ${formatDuration(downMs)}, найдовше ${formatDuration(longestMs)}`,
     );
   }
 
@@ -239,18 +245,18 @@ function formatStats(): string {
     // Measured from the last counted outage, so a short blip doesn't reset it.
     const lastCounted = outages.at(-1);
     const onlineSince = lastCounted?.end ? Date.parse(lastCounted.end) : monitoringSince;
-    lines.push("", `🟢 Online for ${formatDuration(now - onlineSince)} (since ${DATE_FORMAT.format(onlineSince)})`);
+    lines.push("", `🟢 Інтернет є вже ${formatDuration(now - onlineSince)} (з ${DATE_FORMAT.format(onlineSince)})`);
   } else if (state.status === "offline" && lastOutage && !lastOutage.end) {
     const start = Date.parse(lastOutage.start);
-    lines.push("", `🔴 Offline for ${formatDuration(now - start)} (since ${DATE_FORMAT.format(start)})`);
+    lines.push("", `🔴 Інтернету немає вже ${formatDuration(now - start)} (з ${DATE_FORMAT.format(start)})`);
   }
 
   const recent = outages.slice(-RECENT_OUTAGES_SHOWN).reverse();
   if (recent.length > 0) {
-    lines.push("", "Recent outages:");
+    lines.push("", "Останні відключення:");
     for (const outage of recent) {
       const start = Date.parse(outage.start);
-      const end = outage.end ? DATE_FORMAT.format(Date.parse(outage.end)) : "now";
+      const end = outage.end ? DATE_FORMAT.format(Date.parse(outage.end)) : "зараз";
       lines.push(`🔴 ${DATE_FORMAT.format(start)} → ${end} (${formatDuration(outageEndMs(outage, now) - start)})`);
     }
   }
@@ -270,7 +276,7 @@ function handleStats(chatId: number): void {
     } else if (text.length <= TELEGRAM_CAPTION_LIMIT) {
       await sendPhotoToChat(chatId, png, text, STATUS_KEYBOARD);
     } else {
-      await sendPhotoToChat(chatId, png, "📈 Stats");
+      await sendPhotoToChat(chatId, png, "📈 Статистика");
       await sendToChat(chatId, text, STATUS_KEYBOARD);
     }
   });
@@ -313,22 +319,14 @@ async function pollTelegramUpdates(): Promise<void> {
         const text = update.message?.text;
         if (!update.message || !text) continue;
         if (text.startsWith("/start")) handleStart(update.message.chat.id);
-        else if (text === STATUS_BUTTON || text.startsWith("/status")) handleStatus(update.message.chat.id);
-        else if (text === STATS_BUTTON || text.startsWith("/stats")) handleStats(update.message.chat.id);
+        else if (STATUS_BUTTON_TEXTS.includes(text) || text.startsWith("/status")) handleStatus(update.message.chat.id);
+        else if (STATS_BUTTON_TEXTS.includes(text) || text.startsWith("/stats")) handleStats(update.message.chat.id);
       }
     } catch (error) {
       console.error(`Telegram getUpdates failed: ${(error as Error).message}`);
       await sleep(TELEGRAM_RETRY_DELAY_MS);
     }
   }
-}
-
-function formatDuration(ms: number): string {
-  const totalMinutes = Math.floor(ms / 60_000);
-  if (totalMinutes < 1) return `${Math.floor(ms / 1000)}s`;
-  const totalHours = Math.floor(totalMinutes / 60);
-  if (totalHours >= 24) return `${Math.floor(totalHours / 24)}d ${totalHours % 24}h`;
-  return totalHours > 0 ? `${totalHours}h ${totalMinutes % 60}m` : `${totalMinutes}m`;
 }
 
 const state = loadState();
@@ -346,7 +344,7 @@ function markOffline(): void {
   // Nothing is recorded before the first heartbeat, since there is no known online period to compare with.
   if (state.lastSeenAt) state.outages.push({ start: state.lastSeenAt, end: null });
   saveState();
-  notify(`🔴 No internet at home: no request from the ESP32 for ${OFFLINE_TIMEOUT_MS / 1000}s`);
+  notify(`🔴 Вдома немає інтернету: ESP32 не виходить на зв'язок вже ${formatDuration(OFFLINE_TIMEOUT_MS)}`);
 }
 
 function handleHeartbeat(iphoneHome: boolean): void {
@@ -370,9 +368,9 @@ function handleHeartbeat(iphoneHome: boolean): void {
     console.log("Internet is back at home (not sent: iPhone is home)");
   } else if (wasOffline) {
     const downtime = previousSeenAt
-      ? ` (last seen ${formatDuration(Date.now() - Date.parse(previousSeenAt))} ago)`
+      ? ` (не було ${formatDuration(Date.now() - Date.parse(previousSeenAt))})`
       : "";
-    notify(`🟢 Internet is back at home${downtime}`);
+    notify(`🟢 Вдома знову є інтернет${downtime}`);
   }
 }
 
